@@ -17,7 +17,7 @@ Railway IrfanLM Relay
         └── uploads it to Cloudinary
 ```
 
-The extension refreshes each URL immediately before delivery because NotebookLM URLs are short-lived. The phone/browser does not download the audio/video file. Telegram and Cloudinary secrets remain in Railway environment variables.
+The extension refreshes each URL immediately before delivery because NotebookLM URLs are short-lived. The phone/browser does not download the audio/video file. Telegram and Cloudinary secrets remain in Railway environment variables. For Telegram, Railway first writes the complete upstream response to temporary disk, verifies it is non-empty media, and uploads it with a known byte length; this prevents zero-duration or truncated Telegram files.
 
 ## Railway variables
 

@@ -2,7 +2,14 @@ const express = require('express');
 const router  = express.Router();
 const fetch   = require('node-fetch');
 const FormData = require('form-data');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
+const path = require('path');
+const { pipeline } = require('stream/promises');
 const { validateMediaUrl } = require('../middleware/media-url');
+
+const MAX_MEDIA_BYTES = 2 * 1024 * 1024 * 1024;
 
 const BOT_TOKEN      = () => process.env.TELEGRAM_BOT_TOKEN;
 const DEFAULT_CHAT   = () => process.env.TELEGRAM_CHAT_ID;
@@ -39,45 +46,66 @@ function safeFilename(title) {
 async function streamToTelegram({ mediaUrl, title, type, chatId, caption }) {
   const targetChat = chatId || DEFAULT_CHAT();
   if (!targetChat) throw new Error('No chatId provided and TELEGRAM_CHAT_ID not set');
-  if (!BOT_TOKEN())  throw new Error('TELEGRAM_BOT_TOKEN not configured');
+  if (!BOT_TOKEN()) throw new Error('TELEGRAM_BOT_TOKEN not configured');
 
   const safeUrl = validateMediaUrl(mediaUrl);
-
-  // 1. Fetch the signed NotebookLM URL (server-to-server, no mobile data used)
   const mediaRes = await fetch(safeUrl, {
-    headers: { 'User-Agent': 'IrfanLM-Relay/1.0' },
-    timeout: 60000
+    headers: { 'User-Agent': 'IrfanLM-Relay/1.1' },
+    timeout: 120000,
   });
   if (!mediaRes.ok) throw new Error(`Media fetch failed: ${mediaRes.status}`);
 
-  const contentType = mediaRes.headers.get('content-type') || '';
-  const ext      = resolveExt(type, contentType);
-  const filename = `${safeFilename(title)}.${ext}`;
-  const method   = resolveMethod(type);
-  const field    = resolveField(type);
-
-  // 2. Stream directly into a multipart form → Telegram (never fully buffered in RAM)
-  const form = new FormData();
-  form.append('chat_id', String(targetChat));
-  form.append(field, mediaRes.body, {
-    filename,
-    contentType: contentType || 'application/octet-stream'
-  });
-  form.append('caption', caption || title);
-  if (type === '3' || type === 'video') {
-    form.append('supports_streaming', 'true');
+  const contentType = (mediaRes.headers.get('content-type') || '').toLowerCase();
+  const declaredLength = Number(mediaRes.headers.get('content-length') || 0);
+  if (declaredLength > MAX_MEDIA_BYTES) throw new Error('Media file exceeds the 2 GB relay safety limit');
+  if (/text\/html|application\/json|text\/plain/.test(contentType)) {
+    throw new Error(`NotebookLM returned ${contentType || 'text'} instead of media; the signed URL may have expired`);
   }
 
-  // 3. POST to Telegram Bot API
-  const tgRes  = await fetch(TG_API(method), {
-    method: 'POST',
-    body: form,
-    headers: form.getHeaders()
-  });
-  const tgData = await tgRes.json();
-  if (!tgData.ok) throw new Error(`Telegram API error: ${tgData.description}`);
+  // Write the complete response before constructing multipart. This avoids
+  // truncated/zero-duration Telegram files when a streamed body has no reliable
+  // length or the upstream connection closes early.
+  const tempPath = path.join(os.tmpdir(), `irfanlm-${Date.now()}-${Math.random().toString(16).slice(2)}.bin`);
+  try {
+    await pipeline(mediaRes.body, fs.createWriteStream(tempPath));
+    const stat = await fsp.stat(tempPath);
+    if (!stat.size) throw new Error('NotebookLM returned an empty media file');
+    if (stat.size > MAX_MEDIA_BYTES) throw new Error('Media file exceeds the 2 GB relay safety limit');
 
-  return tgData.result?.message_id;
+    const ext = resolveExt(type, contentType);
+    const filename = `${safeFilename(title) || 'notebooklm-item'}.${ext}`;
+    const method = resolveMethod(type);
+    const field = resolveField(type);
+    const form = new FormData();
+    form.append('chat_id', String(targetChat));
+    form.append(field, fs.createReadStream(tempPath), {
+      filename,
+      contentType: contentType || 'application/octet-stream',
+      knownLength: stat.size,
+    });
+    form.append('caption', String(caption || title).slice(0, 1024));
+    if (type === '3' || type === 'video') form.append('supports_streaming', 'true');
+
+    const headers = form.getHeaders();
+    const contentLength = await new Promise((resolve, reject) => {
+      form.getLength((err, length) => err ? reject(err) : resolve(length));
+    });
+    headers['content-length'] = String(contentLength);
+
+    const tgRes = await fetch(TG_API(method), {
+      method: 'POST',
+      body: form,
+      headers,
+      timeout: 180000,
+    });
+    const tgData = await tgRes.json().catch(() => null);
+    if (!tgRes.ok || !tgData?.ok) {
+      throw new Error(`Telegram API error: ${tgData?.description || `HTTP ${tgRes.status}`}`);
+    }
+    return tgData.result?.message_id;
+  } finally {
+    await fsp.rm(tempPath, { force: true }).catch(() => {});
+  }
 }
 
 // ─── POST /telegram/send ──────────────────────────────────────────────────────
