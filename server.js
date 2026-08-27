@@ -28,6 +28,7 @@ app.get('/status', auth, (req, res) => {
 // ─── Routes ──────────────────────────────────────────────────────────────────
 app.use('/telegram',  auth, require('./routes/telegram'));
 app.use('/cloudinary', auth, require('./routes/cloudinary'));
+app.use('/media', auth, require('./routes/media'));
 
 // ─── Global error handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
